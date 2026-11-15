@@ -1,0 +1,8 @@
+.venv/
+__pycache__/
+*.pyc
+shellsense
+output.txt
+processes.txt
+result.txt
+sorted.txt
