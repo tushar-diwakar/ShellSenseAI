@@ -1,4 +1,4 @@
-
+import re
 import json
 import sys
 import urllib.request
@@ -47,6 +47,7 @@ def ask_ai(prompt):
 
     try:
         answer = get_ai_response(prompt, system_prompt)
+
         print("\n========== ShellSense AI ==========")
         print(answer)
         print("===================================\n")
@@ -55,20 +56,16 @@ def ask_ai(prompt):
         print(f"AI error: {error}")
 
 
-
 def generate_command(task):
     system_prompt = """
 You are ShellSense AI, an expert Linux command-line assistant.
 
-Your job is to understand the user's intent and convert it into
-one correct Linux command.
+Convert the user's request into exactly ONE Linux command.
 
 LANGUAGE SUPPORT:
-- Understand English.
-- Understand Hindi.
-- Understand Hinglish.
+- Understand English, Hindi and Hinglish.
 - Understand informal and grammatically incorrect language.
-- Understand different ways of expressing the same request.
+- Understand the actual intent.
 
 RULES:
 1. Return exactly ONE Linux command.
@@ -79,20 +76,16 @@ RULES:
 6. Never use sudo.
 7. Never generate destructive commands such as rm, rmdir,
    mkfs, dd, chmod, chown, shutdown or reboot.
-8. Never generate commands that kill processes or modify
-   important system files.
-9. Prefer standard Linux utilities.
+8. Never generate commands that kill processes.
+9. Never modify important system files.
 10. If the request is unclear or unsafe, return exactly UNSAFE.
 11. Do not invent Linux command options.
-12. Understand the actual intent instead of matching exact words.
-13. If the user is greeting you, thanking you, saying done,
-    okay, goodbye, or having normal conversation, return
-    exactly NO_COMMAND.
-
-14. Do not invent a command for conversational messages.
-
-15. Only generate a command when the user clearly requests
-    a Linux or system operation.
+12. Only generate commands for clear Linux or system operations.
+13. For normal conversation, return exactly NO_COMMAND.
+14. Creating a folder means mkdir, never cd.
+15. Creating a file means touch.
+16. If a filename or folder name is missing, return UNSAFE.
+17. Never guess a missing filename.
 
 Examples:
 
@@ -112,32 +105,10 @@ User: Show running processes
 Output: ps aux
 
 User: Find all Python files
-Output: find . -type f -name '*.py'
+Output: find src -type f -name '*.py'
 
 User: Kernel version batao
 Output: uname -r
-
-User: Delete all files
-Output: UNSAFE
-User: Thank you
-Output: NO_COMMAND
-
-User: done
-Output: NO_COMMAND
-
-User: hello
-Output: NO_COMMAND
-
-User: okay
-Output: NO_COMMAND
-IMPORTANT COMMAND RULES:
-
-- Creating a folder means use mkdir, never cd.
-- Creating a file means use touch.
-- Finding Python files means use:
-  find src -type f -name '*.py'
-
-Examples:
 
 User: Mujhe ek folder banana hai test123
 Output: mkdir test123
@@ -145,41 +116,186 @@ Output: mkdir test123
 User: Create a folder named projects
 Output: mkdir projects
 
-User: Make a new directory called demo
-Output: mkdir demo
+User: Create a file named test.txt
+Output: touch test.txt
 
-User: Find all python files
-Output: find src -type f -name '*.py'
+User: Make a file
+Output: UNSAFE
+
+User: Delete all files
+Output: UNSAFE
 
 User: Thank you
+Output: NO_COMMAND
+
+User: hello
+Output: NO_COMMAND
+
+User: okay
 Output: NO_COMMAND
 
 Return only the command.
 """
 
-    command = get_ai_response(
-        task,
-        system_prompt,
-        max_tokens=100
-    ).strip()
+    try:
+        command = get_ai_response(
+            task,
+            system_prompt,
+            max_tokens=100
+        ).strip()
 
-    command = command.splitlines()[0].strip()
-    if command.lower().startswith("output:"):
-      command = command[7:].strip()
+        command = command.splitlines()[0].strip()
 
-    if command.startswith("```"):
-        command = "UNSAFE"
+        if command.lower().startswith("output:"):
+            command = command[7:].strip()
 
-    print(command)
+        if command.startswith("```"):
+            command = "UNSAFE"
 
+        if command not in ("UNSAFE", "NO_COMMAND") and (
+            "\n" in command
+            or ";" in command
+            or "&&" in command
+            or "||" in command
+            or "|" in command
+            or ">" in command
+            or "<" in command
+        ):
+            command = "UNSAFE"
+
+        print(command)
+
+    except Exception:
+        print("UNSAFE")
+
+
+def route_request(user_input):
+    text = user_input.lower().strip()
+
+    # Clearly educational or conversational questions
+    chat_patterns = [
+        r"^(what is|what are|who is|who are)\b",
+        r"^(why|how|when|where|which)\b",
+        r"^(explain|define|describe|tell me about)\b",
+        r"^(kya hai|kaun hai|kyun|kyu|kaise|kab|samjhao)\b",
+        r"^(linux kya|operating system kya|iska matlab)\b",
+        r"^(hello|hi|hey|thanks|thank you|okay|ok|done)\b"
+    ]
+
+    for pattern in chat_patterns:
+        if re.search(pattern, text):
+            print("CHAT")
+            return
+
+    # File creation without a filename
+    if re.search(
+        r"\b(create|make|banao|banana|banani)\b",
+        text
+    ) and re.search(
+        r"\b(file|folder|directory)\b",
+        text
+    ):
+        has_name = re.search(
+            r"\b(named|called|name|naam|named as)\b",
+            text
+        )
+
+        if not has_name:
+            print("CLARIFY: What should the file or folder be named?")
+            return
+
+    system_prompt = """
+You are the intent router for ShellSense AI.
+
+Classify the user's request into exactly one format:
+
+CHAT
+COMMAND
+CLARIFY: question
+UNSAFE
+
+CHAT:
+Meaningful questions, explanations, greetings and conversation.
+
+COMMAND:
+Only clear requests to perform Linux operations.
+
+CLARIFY:
+File or folder creation requests without a name.
+
+UNSAFE:
+Destructive or dangerous operations.
+
+UNKNOWN:
+Random text, meaningless input, gibberish or requests whose intent
+cannot reasonably be understood.
+
+
+
+Understand English, Hindi and Hinglish.
+Do not confuse questions with commands.
+Examples:
+User: what is Linux
+Output: CHAT
+
+User: show hidden files
+Output: COMMAND
+
+User: hfg
+Output: UNKNOWN
+
+User: asdfgh
+Output: UNKNOWN
+
+User: make a file
+Output: CLARIFY: What should the file be named?
+Return only one classification.
+"""
+
+    try:
+        result = get_ai_response(
+            user_input,
+            system_prompt,
+            max_tokens=60
+        ).strip()
+
+        result = result.splitlines()[0].strip()
+
+        if result.upper() == "CHAT":
+            print("CHAT")
+
+        elif result.upper() == "COMMAND":
+            generate_command(user_input)
+
+        elif result.upper().startswith("CLARIFY:"):
+            print(result)
+
+        elif result.upper() == "UNSAFE":
+            print("UNSAFE")
+
+        elif result.upper() == "UNKNOWN":
+            print("UNKNOWN")
+
+        else:
+            print("UNKNOWN")
+
+    except Exception:
+        print("UNKNOWN")
 
 def main():
     if len(sys.argv) < 3:
-        print("Usage: ai_assistant.py [ask|explain|suggest|diagnose|command] input")
+        print(
+            "Usage: ai_assistant.py "
+            "[auto|ask|explain|suggest|diagnose|command] input"
+        )
         return
 
     mode = sys.argv[1].lower()
-    user_input = " ".join(sys.argv[2:])
+    user_input = " ".join(sys.argv[2:]).strip()
+
+    if mode == "auto":
+        route_request(user_input)
+        return
 
     if mode == "command":
         generate_command(user_input)

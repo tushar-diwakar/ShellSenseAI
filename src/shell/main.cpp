@@ -2205,41 +2205,134 @@ bool validate_ai_command(
 void execute_natural_language(const string& request) {
     cout << "ShellSense AI: Understanding your request...\n";
 
-    string generated = generate_ai_command(request);
-    if (generated == "NO_COMMAND") {
-    cout << "ShellSense AI: I'm here to help with Linux commands!\n";
+    int pipe_fd[2];
+    if (pipe(pipe_fd) == -1) {
+        perror("ShellSense: pipe");
+        return;
+    }
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        perror("ShellSense: fork");
+        close(pipe_fd[0]);
+        close(pipe_fd[1]);
+        return;
+    }
+
+    if (pid == 0) {
+        close(pipe_fd[0]);
+
+        if (dup2(pipe_fd[1], STDOUT_FILENO) == -1) {
+            _exit(126);
+        }
+        close(pipe_fd[1]);
+
+        int devnull = open("/dev/null", O_WRONLY);
+        if (devnull >= 0) {
+            (void)dup2(devnull, STDERR_FILENO);
+            close(devnull);
+        }
+
+        execl(
+            python_bin.c_str(),
+            python_bin.c_str(),
+            ai_script.c_str(),
+            "auto",
+            request.c_str(),
+            (char*)nullptr
+        );
+
+        _exit(127);
+    }
+
+    close(pipe_fd[1]);
+
+    string response;
+    char buffer[512];
+    while (true) {
+        ssize_t count = read(pipe_fd[0], buffer, sizeof(buffer));
+        if (count > 0) {
+            response.append(buffer, static_cast<size_t>(count));
+        } else if (count == 0) {
+            break;
+        } else if (errno != EINTR) {
+            perror("ShellSense: read AI response");
+            break;
+        }
+    }
+    close(pipe_fd[0]);
+
+    int status = 0;
+    pid_t waited;
+    do {
+        waited = waitpid(pid, &status, 0);
+    } while (waited == -1 && errno == EINTR);
+
+    if (waited == -1 || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        cerr << "ShellSense AI: Intent detection failed. Check the Python AI setup.\n";
+        return;
+    }
+
+    // Remove surrounding whitespace and trailing newlines from the protocol response.
+    size_t first = response.find_first_not_of(" \t\r\n");
+    if (first == string::npos) {
+        cerr << "ShellSense AI: Empty response.\n";
+        return;
+    }
+    size_t last = response.find_last_not_of(" \t\r\n");
+    response = response.substr(first, last - first + 1);
+
+    // CHAT means the request is a question/conversation, not a shell command.
+    if (response == "CHAT") {
+        vector<string> ai_args = {
+            python_bin,
+            ai_script,
+            "ask",
+            request
+        };
+        execute_external_command(ai_args, "", "", false, request);
+        return;
+    }
+
+    // CLARIFY:... means the AI needs more information before generating a command.
+    if (response.rfind("CLARIFY:", 0) == 0) {
+        string clarification = response.substr(8);
+        size_t message_start = clarification.find_first_not_of(" \t");
+        if (message_start != string::npos) {
+            clarification.erase(0, message_start);
+        }
+        cout << "ShellSense AI: " << clarification << '\n';
+        return;
+    }
+
+if (response == "UNKNOWN") {
+    cout << "ShellSense AI: I couldn't understand your request. Please try again.\n";
     return;
 }
-    cout << "[DEBUG] Raw AI output: [" << generated << "]\n";
 
-    if (generated == "NO_COMMAND") {
-        cout << "ShellSense AI: I'm here to help with Linux commands!\n";
-        return;
-    }
-
-    if (generated.empty()) {
-        cerr << "ShellSense AI: Could not generate a command.\n";
-        return;
-    }
+if (response == "UNSAFE" || response == "NO_COMMAND") {
+    cout << "ShellSense AI: I couldn't identify a safe Linux command for that request.\n";
+    return;
+}
 
     vector<string> args;
-
-    if (!validate_ai_command(generated, args)) {
+    if (!validate_ai_command(response, args)) {
         cerr << "ShellSense AI: Generated command was rejected for safety.\n";
         return;
     }
 
-    cout << "AI generated: " << generated << "\n";
+    cout << "AI generated: " << response << '\n';
 
-    // Commands that modify files require confirmation.
+    // File and directory creation always require explicit confirmation.
     if (args[0] == "mkdir" || args[0] == "touch") {
         cout << "This command will modify your filesystem.\n";
         cout << "Execute? (y/n): ";
+        cout.flush();
 
         string answer;
         if (!getline(cin, answer)) {
             cin.clear();
-            cout << "Cancelled.\n";
+            cout << "Command cancelled.\n";
             return;
         }
 
@@ -2251,14 +2344,7 @@ void execute_natural_language(const string& request) {
     }
 
     cout << "Executing command...\n";
-
-    execute_external_command(
-        args,
-        "",
-        "",
-        false,
-        request
-    );
+    execute_external_command(args, "", "", false, request);
 }
 
 bool executable_exists(const string& command) {
@@ -2399,17 +2485,55 @@ int main() {
         string first_word;
         input_stream >> first_word;
 
-        if (!first_word.empty() &&
-            first_word != "ai" &&
-            !is_shell_builtin_name(first_word) &&
-            !executable_exists(first_word)) {
 
-            command_history.push_back(input);
+string lower_input = input;
 
-            execute_natural_language(input);
+transform(
+    lower_input.begin(),
+    lower_input.end(),
+    lower_input.begin(),
+    [](unsigned char c) {
+        return static_cast<char>(tolower(c));
+    }
+);
 
-            continue;
-        }
+// Detect natural-language file and folder creation requests.
+bool is_creation_request =
+    lower_input.find("make a file") != string::npos ||
+    lower_input.find("make file") != string::npos ||
+    lower_input.find("make a new file") != string::npos ||
+    lower_input.find("create a file") != string::npos ||
+    lower_input.find("create file") != string::npos ||
+    lower_input.find("create a new file") != string::npos ||
+    lower_input.find("make a folder") != string::npos ||
+    lower_input.find("make folder") != string::npos ||
+    lower_input.find("create a folder") != string::npos ||
+    lower_input.find("create folder") != string::npos ||
+    lower_input.find("make a directory") != string::npos ||
+    lower_input.find("create a directory") != string::npos ||
+    lower_input.find("file banao") != string::npos ||
+    lower_input.find("folder banao") != string::npos ||
+    lower_input.find("directory banao") != string::npos ||
+    lower_input.find("file banana") != string::npos ||
+    lower_input.find("folder banana") != string::npos;
+
+if (
+    is_creation_request ||
+    (
+        !first_word.empty() &&
+        first_word != "ai" &&
+        !is_shell_builtin_name(first_word) &&
+        !executable_exists(first_word)
+    )
+) {
+    command_history.push_back(input);
+
+    execute_natural_language(input);
+
+    continue;
+}
+
+        
 
         ParsedLine parsed = parse_input(input);
 
